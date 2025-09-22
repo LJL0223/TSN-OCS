@@ -1,0 +1,80 @@
+// ========= PARAMETERS =========
+int F = ...;                              // Number of flows
+range Flows = 1..F;
+
+float cycle_len = ...;                    // Cycle length (ms)
+float slot_len = ...;                     // Slot granularity (ms)
+int M = ftoi(ceil(cycle_len)) + 1;        // Big-M constant
+float link_bw = ...;                   // Link bandwidth in Mbps
+{int} conflict_nodes = ...;                  
+int slot_count = ...;
+
+
+// Flow parameters
+float rate[Flows] = ...;                 // Mbps
+float delay_to_dest[Flows] = ...;        // Propagation delay to destination (ms)
+float delay_bound[Flows] = ...;          // End-to-end delay constraint (ms)
+float init_time[Flows] = ...;            // Earliest possible start time (ms)
+int priority[Flows] = ...;               // Priority level (0 = highest)
+
+// Conflict representation (including conflict node)
+tuple Conflict {
+  int f1;
+  int f2;
+  int node;
+}
+{Conflict} ConflictSet = ...;
+
+int N = ...;                             // Number of nodes
+range Nodes = 1..N;
+
+// Delay to specific nodes
+float delay_to_node[Flows][Nodes] = ...;
+
+// ========= DECISION VARIABLES =========
+dvar int start_slot[Flows];
+dexpr float flow_start[f in Flows] = start_slot[f] * slot_len;         // Flow start time (ms)
+dvar boolean b[ConflictSet];             // Binary conflict order switch per Conflict
+
+
+// ========= EXPRESSIONS =========
+dexpr float transmission_time[f in Flows] = 
+  (rate[f] * cycle_len) / link_bw;       // Transmission time
+
+dexpr float flow_end[f in Flows] = 
+  flow_start[f] + transmission_time[f];
+
+dexpr float arrive_at_node[f in Flows][n in Nodes] = 
+  flow_start[f] + delay_to_node[f][n];
+
+
+// ========= OBJECTIVE =========
+minimize sum(f in Flows) 
+  (1.0 / (priority[f] + 1)) * flow_start[f];
+
+// ========= CONSTRAINTS =========
+subject to {
+  // Conflict avoidance per conflict node
+  forall(n in conflict_nodes) {
+    forall(c in ConflictSet : c.node == n) {
+      arrive_at_node[c.f1][n] >= arrive_at_node[c.f2][n] + transmission_time[c.f2] - M * (1 - b[c]);
+      arrive_at_node[c.f2][n] >= arrive_at_node[c.f1][n] + transmission_time[c.f1] - M * b[c];
+    }
+  }
+
+  // Basic timing constraints
+  forall(f in Flows) flow_end[f] <= cycle_len;
+  forall(f in Flows) flow_start[f] + delay_to_dest[f] <= delay_bound[f];
+  forall(f in Flows) flow_start[f] >= init_time[f];
+}
+dexpr float obj_value = sum(f in Flows) (1.0 / (priority[f] + 1)) * flow_start[f];
+
+execute {
+  var out = new IloOplOutputFile("flow_start.txt");
+  for (var f in Flows) {
+    out.writeln("flow_start[", f, "] = ", flow_start[f]);
+  }
+
+  out.writeln("Objective = ", obj_value);
+  out.close();
+}
