@@ -1,0 +1,436 @@
+import pandas as pd
+import networkx as nx
+import itertools
+import subprocess
+import os
+import time
+
+# 参数配置
+slot_len = 0.5
+cycle_len = 10.0
+slot_count = 20
+link_bw = 1000.0
+k_paths = 3
+time_sync_error_buffer = 0.03
+
+
+# 文件路径
+excel_path = r"C:\Users\shlij\Desktop\network_input.xlsx"
+mod_file = r"C:\Users\shlij\opl\tsn\schedule_8points.mod"
+dat_file = r"C:\Users\shlij\opl\tsn\schedule_8points.dat"
+txt_output_path = r"C:\Users\shlij\opl\tsn\flow_start.txt"
+
+
+# 节点映射
+class NodeMapper:
+    def __init__(self):
+        self.node_mapping = {}  # 名称 -> ID
+        self.reverse_mapping = {}  # ID -> 名称
+        self.current_id = 1
+
+    def get_id(self, node_name):
+        # 处理浮点型节点编号（如3.0 -> 3）
+        if isinstance(node_name, float) and node_name.is_integer():
+            node_name = int(node_name)
+        node_name = str(node_name).strip()
+
+        if node_name not in self.node_mapping:
+            self.node_mapping[node_name] = self.current_id
+            self.reverse_mapping[self.current_id] = node_name
+            self.current_id += 1
+        return self.node_mapping[node_name]
+
+    def get_name(self, node_id):
+        return self.reverse_mapping.get(node_id, f"UNKNOWN_{node_id}")
+
+    def print_mapping(self):
+        print("\n=== Node Mapping Table ===")
+        print("{:<8} {:<15}".format("ID", "Node"))
+        for id_, name in sorted(self.reverse_mapping.items()):
+            print("{:<8} {:<15}".format(id_, name))
+
+
+# 初始化映射
+mapper = NodeMapper()
+
+# 拓扑读取
+df_topo = pd.read_excel(excel_path, sheet_name="topology")
+G = nx.Graph()
+delay_dict = {}
+
+for idx, row in df_topo.iterrows():
+    try:
+        n1, n2, d = row.iloc[0], row.iloc[1], float(row.iloc[2])
+        id1, id2 = mapper.get_id(n1), mapper.get_id(n2)
+        G.add_edge(id1, id2, weight=d)
+        delay_dict[(id1, id2)] = d
+        delay_dict[(id2, id1)] = d
+    except Exception as e:
+        print(f"! 拓扑行{idx + 1}处理失败: {row.values} | 错误: {e}")
+        raise
+
+# 流量数据读取
+df_flow = pd.read_excel(excel_path, sheet_name="flows").sort_values(by="priority")
+flow_k_paths = []
+base_flows = []
+
+for idx, row in df_flow.iterrows():
+    try:
+        fid = int(row.iloc[0])
+        original_source = row.iloc[5]
+        original_dest = row.iloc[6]
+
+        source = mapper.get_id(original_source)
+        dest = mapper.get_id(original_dest)
+
+        # 检查节点是否存在
+        if source not in G.nodes:
+            print(f"! 流量{fid}警告: 源节点[{original_source}]不在拓扑中，已自动添加")
+            G.add_node(source)
+        if dest not in G.nodes:
+            print(f"! 流量{fid}警告: 目的节点[{original_dest}]不在拓扑中，已自动添加")
+            G.add_node(dest)
+
+        # 计算K最短路径
+        try:
+            k_shortest = list(itertools.islice(
+                nx.shortest_simple_paths(G, source, dest, weight='weight'),
+                k_paths))
+        except nx.NetworkXNoPath:
+            k_shortest = []
+            print(f"! 流量{fid}警告: 无可行路径 {original_source}->{original_dest}")
+
+        flow_k_paths.append(k_shortest)
+        base_flows.append({
+            "id": fid,
+            "rate": float(row.iloc[1]),
+            "delay_bound": float(row.iloc[2]),
+            "init_time": float(row.iloc[3]),
+            "priority": int(row.iloc[4]),
+            "source": source,
+            "dest": dest,
+            "original_source": original_source,
+            "original_dest": original_dest,
+            "valid": bool(k_shortest)
+        })
+    except Exception as e:
+        print(f"! 流量行{idx + 1}处理失败: {e}")
+        raise
+
+# 打印统计信息
+valid_flows = sum(1 for f in base_flows if f['valid'])
+mapper.print_mapping()
+
+
+# 在原参数配置后添加（约第10行附近）
+def get_highest_priority_flows(base_flows):
+    """找出每个源节点优先级最高的流量"""
+    source_flows = {}
+    for flow in base_flows:
+        src = flow['source']
+        if src not in source_flows or flow['priority'] < source_flows[src]['priority']:
+            source_flows[src] = {
+                'flow_id': flow['id'],
+                'priority': flow['priority'],
+                'init_time': flow['init_time']
+            }
+        # 处理优先级相同的情况：选择初始时间更早的
+        elif flow['priority'] == source_flows[src]['priority']:
+            if flow['init_time'] < source_flows[src]['init_time']:
+                source_flows[src] = {
+                    'flow_id': flow['id'],
+                    'priority': flow['priority'],
+                    'init_time': flow['init_time']
+                }
+    return source_flows
+def compute_arrival_leave(flows):
+    result = {}
+    for flow in flows:
+        path = flow['path']
+        rate = flow['rate']
+        init_time = flow['init_time']
+        trans_time = (rate / link_bw) * cycle_len
+        arr = {path[0]: init_time}
+        leave = {path[0]: init_time + trans_time}
+        for i in range(1, len(path)):
+            d = delay_dict.get((path[i - 1], path[i]), 0.0)
+            arr[path[i]] = arr[path[i - 1]] + d
+            leave[path[i]] = arr[path[i]] + trans_time
+        result[flow['id']] = {'arrival': arr, 'leave': leave}
+    return result
+
+
+def compute_delay_to_dest(path):
+    """路径延迟计算（保留）"""
+    return sum(delay_dict.get((path[i], path[i + 1]), 0.0) for i in range(len(path) - 1))
+
+
+def detect_conflicts(flows, time_map):
+    """冲突检测（保留）"""
+    result = set()
+    for i in range(len(flows)):
+        for j in range(i + 1, len(flows)):
+            f1, f2 = flows[i], flows[j]
+            common = set(f1['path'][1:-1]) & set(f2['path'][1:-1])
+            for node in common:
+                a1, l1 = time_map[f1['id']]['arrival'][node], time_map[f1['id']]['leave'][node]
+                a2, l2 = time_map[f2['id']]['arrival'][node], time_map[f2['id']]['leave'][node]
+                if max(a1, a2) < min(l1, l2):
+                    result.add((f1['id'], f2['id'], node))
+    return result
+
+def export_dat(flows, conflicts, time_map, filename):
+    highest_pri_flows = get_highest_priority_flows(flows)
+    with open(filename, 'w') as f:
+        f.write(f"F = {len(flows)};\n")
+        f.write(f"N = {len(G.nodes)};\n")
+        f.write(f"slot_len = {slot_len};\n")
+        f.write(f"cycle_len = {cycle_len};\n")
+        f.write(f"slot_count = {slot_count};\n")
+        f.write(f"link_bw = {link_bw};\n\n")
+
+        f.write("rate = [" + ", ".join(str(apply_buffer_to_rate(f, time_sync_error_buffer)) for f in flows) + "];\n")
+        f.write("delay_to_dest = [" + ", ".join(f"{compute_delay_to_dest(f['path']):.3f}" for f in flows) + "];\n")
+        f.write("delay_bound = [" + ", ".join(str(f['delay_bound']) for f in flows) + "];\n")
+        f.write("init_time = [" + ", ".join(str(f['init_time']) for f in flows) + "];\n")
+        f.write("priority = [" + ", ".join(str(f['priority']) for f in flows) + "];\n\n")
+
+        f.write("ConflictSet = {\n")
+        for f1, f2, n in sorted(conflicts):
+            f.write(f"  <{f1}, {f2}, {n}>,\n")
+        f.write("};\n\n")
+
+        node_set = sorted(set(n for pair in delay_dict for n in pair))
+        node_idx = {n: i for i, n in enumerate(node_set)}
+        f.write("conflict_nodes = {" + ", ".join(str(n) for _, _, n in conflicts) + "};\n\n")
+
+        f.write("delay_to_node = [\n")
+        for flow in flows:
+            row = [0.0] * len(node_set)
+            for n in flow['path']:
+                idx = node_idx[n]
+                row[idx] = round(time_map[flow['id']]['arrival'][n] - flow['init_time'], 3)
+            f.write("  [" + ", ".join(f"{v:.3f}" for v in row) + "],\n")
+        f.write("];\n")
+
+
+def apply_buffer_to_rate(flow, buffer_ms):
+    base_rate = flow['rate']
+    rate_with_buffer = base_rate + (buffer_ms * link_bw) / cycle_len
+    return round(rate_with_buffer, 3)
+
+def compute_arrival_leave_with_flow_start(flows, delay_dict):
+    result = {}
+    for flow in flows:
+        path = flow['path']
+        rate = flow['rate']
+        start_time = flow['flow_start']  # 使用 flow_start 替代 init_time
+        trans_time = (rate / link_bw) * cycle_len
+        arr = {path[0]: start_time}
+        leave = {path[0]: start_time + trans_time}
+        for i in range(1, len(path)):
+            d = delay_dict.get((path[i - 1], path[i]), 0.0)
+            arr[path[i]] = arr[path[i - 1]] + d
+            leave[path[i]] = arr[path[i]] + trans_time
+        result[flow['id']] = {'arrival': arr, 'leave': leave}
+    return result
+
+def detect_switching_delays(flows, time_map, optical_nodes, threshold=1.0):
+    switching_record = {flow['id']: [] for flow in flows}
+
+    for node in optical_nodes:
+        passing_flows = []
+        for flow in flows:
+            if node in flow['path']:
+                fid = flow['id']
+                arrival = time_map[fid]['arrival'][node]
+                leave = time_map[fid]['leave'][node]
+                passing_flows.append((fid, arrival, leave))
+
+        # 排序：按照到达时间
+        passing_flows.sort(key=lambda x: x[1])
+
+        for i in range(1, len(passing_flows)):
+            prev_fid, _, prev_leave = passing_flows[i - 1]
+            curr_fid, curr_arrival, _ = passing_flows[i]
+            if curr_arrival - prev_leave < threshold:
+                switching_record[curr_fid].append(node)
+
+    return switching_record
+
+def calculate_solution_score(solutions, delay_dict):
+    # 收集所有解的三个原始指标
+    all_objectives = []
+    all_hops = []
+    all_delays = []
+
+    # 第一轮遍历：收集原始数据
+    for sol in solutions:
+        # 计算优先级权重（0最高，7最低）
+        priorities = [flow['priority'] for flow in sol['flows']]
+        priority_weights = [max(priorities) - p + 1 for p in priorities]
+        total_weight = sum(priority_weights)
+
+        # 计算原始加权指标
+        weighted_hops = 0
+        weighted_delay = 0.0
+        for i, flow in enumerate(sol['flows']):
+            path = flow['path']
+            weighted_hops += (len(path) - 1) * (priority_weights[i] / total_weight)
+            weighted_delay += sum(delay_dict.get((path[j], path[j + 1]), 0.0) for j in range(len(path) - 1)) * (
+                        priority_weights[i] / total_weight)
+
+        all_objectives.append(sol['objective'])
+        all_hops.append(weighted_hops)
+        all_delays.append(weighted_delay)
+
+    # 计算归一化系数
+    max_obj = max(all_objectives) or 1
+    max_hops = max(all_hops) or 1
+    max_delay = max(all_delays) or 1
+
+    # 第二轮遍历：计算归一化评分
+    scored_solutions = []
+    for idx, sol in enumerate(solutions):
+        # 归一化处理
+        norm_obj = all_objectives[idx] / max_obj
+        norm_hops = all_hops[idx] / max_hops
+        norm_delay = all_delays[idx] / max_delay
+
+        # 加权计算
+        weights = {'objective': 0.5, 'hops': 0.2, 'delay': 0.3}
+        score = (weights['objective'] * norm_obj +
+                 weights['hops'] * norm_hops +
+                 weights['delay'] * norm_delay)
+
+        scored_solutions.append({
+            'solution': sol,
+            'score': score,
+            'metrics': {
+                'normalized': (norm_obj, norm_hops, norm_delay),
+                'raw': (all_objectives[idx], all_hops[idx], all_delays[idx])
+            }
+        })
+
+    return scored_solutions
+
+# 主调度流程
+if valid_flows == 0:
+    print("\n! Error: No valid flow paths found.")
+    exit()
+
+# 记录开始时间
+runtime_start = time.time()
+
+
+combinations = list(itertools.product(*flow_k_paths))
+valid_combinations = [c for c in combinations if all(c)]
+
+feasible_solutions = []
+total_opl_runtime = 0  # 记录OPL求解总时间
+
+for combo_idx, combo in enumerate(valid_combinations, 1):
+    current_flows = []
+    for flow_idx, path in enumerate(combo):
+        flow = base_flows[flow_idx].copy()
+        flow['path'] = path
+        current_flows.append(flow)
+
+    time_map = compute_arrival_leave(current_flows)
+    conflicts = detect_conflicts(current_flows, time_map)
+    export_dat(current_flows, conflicts, time_map, dat_file)
+
+    if os.path.exists(txt_output_path):
+        os.remove(txt_output_path)
+
+    # 记录OPL求解时间
+    opl_start = time.time()
+    subprocess.run(
+        ["oplrun", mod_file, dat_file],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    total_opl_runtime += time.time() - opl_start
+
+    solution = {
+        "combo": combo,
+        "flows": current_flows,
+        "start_times": [],
+        "objective": None
+    }
+
+    if os.path.exists(txt_output_path):
+        with open(txt_output_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("flow_start"):
+                    solution["start_times"].append(float(line.split('=')[1]))
+                elif line.startswith("Objective"):
+                    solution["objective"] = float(line.split('=')[1])
+
+    if solution["objective"] is not None:
+        feasible_solutions.append(solution)
+        for i, start_time in enumerate(solution["start_times"]):
+            solution["flows"][i]["flow_start"] = start_time
+
+# 计算总运行时间
+total_runtime = time.time() - runtime_start
+
+
+# 主流程中调用
+if not feasible_solutions:
+    print("\nNo feasible solutions found.")
+else:
+    # 计算评分
+    scored_solutions = calculate_solution_score(feasible_solutions, delay_dict)
+    scored_solutions.sort(key=lambda x: x['score'])  # 按评分升序
+
+    # 仅获取排名第一的解决方案
+    if scored_solutions:
+        best_solution = scored_solutions[0]
+        sol = best_solution['solution']
+        norm_obj, norm_hops, norm_delay = best_solution['metrics']['normalized']
+        raw_obj, raw_hops, raw_delay = best_solution['metrics']['raw']
+
+        # 输出最佳解决方案
+        print("\n" + "=" * 80)
+        print(f"\nBest Solution | Score: {best_solution['score']:.4f}")
+        print(f"Values: Obj={raw_obj:.4f}, Hops={raw_hops:.2f}, Delay={raw_delay:.4f}ms")
+        print("-" * 60)
+
+        # 显示每个流详情
+        for flow in sol['flows']:
+            path = flow['path']
+            flow_start = flow.get("flow_start", None)
+            flow_start_str = f"{flow_start:.2f}" if flow_start is not None else "N/A"
+            print(f"Flow {flow['id']} (Prio {flow['priority']}, Start {flow_start_str}): "
+                  f"{'→'.join(mapper.get_name(n) for n in path)} "
+                  f"(Hops: {len(path) - 1}, Delay: {sum(delay_dict.get((path[i], path[i + 1]), 0.0) for i in range(len(path) - 1)):.2f}ms)")
+
+# 输出简化时间统计
+print("\n" + "=" * 60)
+print("Performance Statistics:")
+print(f"- Total runtime: {total_runtime:.2f} seconds")
+print(f"- OPL solving time: {total_opl_runtime:.2f} seconds")
+print("=" * 60)
+print("\nScheduling completed successfully.")
+# 提取最佳调度流量
+best_flows = best_solution['solution']['flows']
+
+# 使用调度后时间计算新的 arrival/leave 信息
+arrival_leave_map = compute_arrival_leave_with_flow_start(best_flows, delay_dict)
+
+# 指定 optical 节点 ID
+optical_nodes = list(range(1, 25))  # 节点ID从1到24  # 根据实际拓扑修改
+
+# 检测 switching delay 发生情况
+switching_result = detect_switching_delays(best_flows, arrival_leave_map, optical_nodes)
+
+# 输出结果
+print("\n=== Switching Delay Report ===")
+for fid, nodes in switching_result.items():
+    if nodes:
+        readable_nodes = [mapper.get_name(n) for n in nodes]
+        print(f"Flow {fid} has switching delay at: {', '.join(readable_nodes)}")
+    else:
+        print(f"Flow {fid} has no switching delay")
